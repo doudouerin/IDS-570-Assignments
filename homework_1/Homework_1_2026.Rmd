@@ -1,0 +1,235 @@
+---
+title: "IDS 570 - Homework 1: Text Preparation"
+subtitle: "Stopword Removal Diagnostics and Interpretation Guide"
+author: "Irene Lin"
+date: "2026-09-09"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tidytext)
+library(ggplot2)
+library(forcats)
+library(tibble)
+library(scales)
+```
+
+# Session I: create a diagnostics table 
+The local IDS data folder is `/Users/linyuxin/Desktop/IDS/texts/original from Canvas`. Please set to your own directory when running. 
+
+```{r}
+file_a <- "//Users/linyuxin/Desktop/IDS/texts/original from Canvas/A07594__Circle_of_Commerce.txt"
+file_b <- "/Users/linyuxin/Desktop/IDS/texts/original from Canvas/B14801__Free_Trade.txt"
+
+text_a <- read_file(file_a)
+text_b <- read_file(file_b)
+
+texts <- tibble(
+  doc_title = c("Text A", "Text B"),
+  text = c(text_a, text_b)
+)
+
+data("stop_words")
+
+custom_stopwords <- tibble(
+  word = c("vnto", "haue", "doo", "hath", "bee", "ye", "thee")
+)
+
+all_stopwords <- bind_rows(stop_words, custom_stopwords) %>%
+  distinct(word)
+
+words <- texts %>%
+  unnest_tokens(word, text)
+
+words_after_stopwords <- words %>%
+  anti_join(all_stopwords, by = "word")
+```
+
+The diagnostic table counts tokens before and after the filter and calculates the size of the transformation.
+
+```{r corpus-diagnostics}
+tokens_before <- words %>%
+  count(doc_title, name = "total_tokens")
+
+tokens_after <- words_after_stopwords %>%
+  count(doc_title, name = "tokens_after_stopwords")
+
+corpus_diagnostics <- tokens_before %>%
+  left_join(tokens_after, by = "doc_title") %>%
+  mutate(
+    tokens_removed = total_tokens - tokens_after_stopwords,
+    percent_removed = 100 * tokens_removed / total_tokens
+  )
+
+knitr::kable(
+  corpus_diagnostics %>%
+    mutate(percent_removed = round(percent_removed, 2)),
+  caption = "Tokens removed by the complete stopword list"
+)
+```
+
+## Interpretive questions for Section I
+
+In Text A, there are 56.66% of the texts removed as stopwords and that of Test B is 59.86%. The difference between these two is 3.2 percentage points. I think it is fair to say that the percentage removed from both texts are pretty similar. As over half of the texts are stopwords in both cases, this transformation implies how the large set of textual data before cleaning could be "inflated", not necessarily providing new information. However, it is also important to be aware that this conclusion is very dependent on what research question one tries to answer (what kinds of words are removed and to what extent). 
+
+
+# II. Frequent words before and after stopword removal
+```{r counts-before}
+word_counts_before <- words %>%
+  count(doc_title, word, sort = TRUE)
+
+word_comparison_before <- word_counts_before %>%
+  pivot_wider(
+    names_from = doc_title,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  mutate(max_n = pmax(`Text A`, `Text B`)) %>%
+  arrange(desc(max_n))
+
+top_15_before <- word_comparison_before %>%
+  slice_head(n = 15)
+
+plot_data_before <- top_15_before %>%
+  pivot_longer(
+    cols = c(`Text A`, `Text B`),
+    names_to = "doc_title",
+    values_to = "n"
+  ) %>%
+  mutate(word = fct_reorder(word, n, .fun = max))
+
+knitr::kable(
+  top_15_before,
+  caption = "Top 15 words before stopword removal, by maximum document frequency"
+)
+```
+
+```{r plot-before}
+plot_n_words <- 15
+
+plot_before <- ggplot(
+  plot_data_before,
+  aes(x = n, y = word)
+) +
+  geom_col() +
+  facet_wrap(~ doc_title, scales = "free_x") +
+  labs(
+    title = "Most frequent words before stopword removal",
+    subtitle = paste0(
+      "Top ", plot_n_words,
+      " words by maximum frequency across both texts"
+    ),
+    x = "Word frequency",
+    y = NULL
+  ) +
+  theme_minimal()
+
+plot_before
+```
+
+## B. After stopword removal
+
+```{r counts-after}
+word_counts_after <- words_after_stopwords %>%
+  count(doc_title, word, sort = TRUE)
+
+word_comparison_after <- word_counts_after %>%
+  pivot_wider(
+    names_from = doc_title,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  mutate(max_n = pmax(`Text A`, `Text B`)) %>%
+  arrange(desc(max_n))
+
+top_15_after <- word_comparison_after %>%
+  slice_head(n = 15)
+
+plot_data_after <- top_15_after %>%
+  pivot_longer(
+    cols = c(`Text A`, `Text B`),
+    names_to = "doc_title",
+    values_to = "n"
+  ) %>%
+  mutate(word = fct_reorder(word, n, .fun = max))
+
+knitr::kable(
+  top_15_after,
+  caption = "Top 15 words after removal of standard and custom stopwords"
+)
+```
+
+```{r plot-after}
+plot_after <- ggplot(
+  plot_data_after,
+  aes(x = n, y = word)
+) +
+  geom_col() +
+  facet_wrap(~ doc_title, scales = "free_x") +
+  labs(
+    title = "Most frequent words after stopword removal",
+    subtitle = paste0(
+      "Top ", plot_n_words,
+      " words by maximum frequency across both texts"
+    ),
+    x = "Word frequency",
+    y = NULL
+  ) +
+  theme_minimal()
+
+plot_after
+```
+
+## Interpretive questions for Section II
+
+Before the removal of stopwords, the most frequent word is "the", 2376 in Text A and 1603 in Text B. However, after removing the stopwords, "trade" becomes the most frequent one, which actually correspond to the theme of these two texts. Other frequent words include "money" and "merchants" (in both texts). The plots make economic vocabulary more visible, but they also makes  grammatical style, pronoun use, or forms of address less obvious. For example, words like “his” reveal how frequently the author refers to male individuals, while the frequent uses of "that" and "which" might show language habit of using clauses. 
+
+
+# III. Effect of the custom stopword list
+
+Remove the standard stopwords but keeps the seven custom Early Modern English stopwords.
+
+```{r standard-only-analysis}
+words_standard_only <- words %>%
+  anti_join(stop_words, by = "word")
+
+word_counts_standard_only <- words_standard_only %>%
+  count(doc_title, word, sort = TRUE)
+
+word_comparison_standard_only <- word_counts_standard_only %>%
+  pivot_wider(
+    names_from = doc_title,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  mutate(max_n = pmax(`Text A`, `Text B`)) %>%
+  arrange(desc(max_n))
+
+top_15_standard_only <- word_comparison_standard_only %>%
+  slice_head(n = 15)
+
+knitr::kable(
+  top_15_standard_only,
+  caption = "Top 15 words after removing standard stopwords only"
+)
+```
+
+## Interpretive questions for Section III
+
+In this table, there are several historical spelling of very common grammatical words, including "haue", "bee", and "hee". They are not very informative in term of showing the general theme of free trade or commence, but does implies the writing habit of the author and of the time. For example, if the research question is about how grammar involves in English and what social factors might related to the change over time, counting their frequencies might be very helpful. Thus, there will not be an universally "correct" stopword list. One needs to adjust and customize it based on the research question, the corpus/text itself, and the time context under which these corpuses were created. 
+
+
+# Final reflection: possible directions
+
+For one thing, cleaning the stop words completely change the level of information from texts. Stopword removal eliminated 56.66% of the tokens in Text A and 59.86% in Text B, demonstrating that pre-processing substantially changes the representation available for analysis. It does change the sample itself, and the amount of information left. More importantly, there is a trade-off of what kinds of conclusions you get before and after removing the stopwords. For example, after keeping the customized stopwords and only removing the standard ones, we get more grammatical and rhetorical information but no so much in terms of themes as we did in Section II. 

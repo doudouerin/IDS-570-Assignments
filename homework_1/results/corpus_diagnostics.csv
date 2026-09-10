@@ -1,0 +1,3 @@
+doc_title,total_tokens,tokens_after_stopwords,tokens_removed,percent_removed
+Text A,33889,14694,19195,56.64079789902328
+Text B,19922,8004,11918,59.82331091255898
