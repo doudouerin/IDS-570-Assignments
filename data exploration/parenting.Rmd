@@ -1,0 +1,1379 @@
+---
+title: "r/Parenting Exploration: Reproducible R Guideline"
+author: "IDS 570 exploratory assignment"
+date: "2026-10-14"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+## Goal and analytical design
+
+The exploratory research question is:
+
+> **What parenting topics and emotional concerns appear in a sample of r/Parenting discussions?**
+
+The sample contains ten eligible threads with the highest original-post scores and ten eligible threads with the largest reported discussion volume. A **thread is the discussion case**. Three text scopes are retained within each case:
+
+1. `original_post`: title plus original-post text;
+2. `all_comments`: all available comment text combined;
+3. `whole_thread`: original post plus all available comments.
+
+The analysis is exploratory. Topic labels are reviewed manually with TF–IDF and KWIC evidence. Dictionary scores describe lexical associations; they are not direct measurements of psychological states.
+
+```{r setup, message=FALSE, warning=FALSE}
+project_dir <- "/Users/linyuxin/Desktop/IDS/data exploration"
+
+library(tidyverse)
+library(tidytext)
+library(quanteda)
+library(jsonlite)
+library(digest)
+library(knitr)
+
+raw_dir <- file.path(project_dir, "data", "raw")
+data_dir <- file.path(project_dir, "data", "processed")
+variant_dir <- file.path(data_dir, "cleaning_variants")
+table_dir <- file.path(project_dir, "output", "tables")
+figure_dir <- file.path(project_dir, "output", "figures")
+
+theme_set(theme_minimal(base_size = 11))
+```
+
+## Public source, local storage, and reproduction order
+
+The source is Cornell University's public ConvoKit Reddit Corpus. In that corpus, a Reddit post and its comments form one conversation; an individual post or comment is an utterance. The r/Parenting archive covers the subreddit through October 2018. 
+
+Dataset documentation: <https://convokit.cornell.edu/documentation/subreddit.html>
+
+```{r download-public-data}
+source_url <- paste0(
+  "https://zissou.infosci.cornell.edu/convokit/datasets/",
+  "subreddit-corpus/corpus-zipped/Parenting.corpus.zip"
+)
+zip_path <- file.path(raw_dir, "Parenting.corpus.zip")
+
+
+extracted_dir <- file.path(raw_dir, "Parenting.corpus")
+dir.create(extracted_dir, showWarnings = FALSE)
+
+conversation_path <- file.path(extracted_dir, "conversations.json")
+utterance_path <- file.path(extracted_dir, "utterances.jsonl")
+
+archive_members <- c("conversations.json", "utterances.jsonl")
+member_paths <- file.path(extracted_dir, archive_members)
+missing_members <- archive_members[!file.exists(member_paths)]
+
+```
+
+## Derive and audit the 10 + 10 discussion sample
+
+```{r read-conversation-metadata}
+conversation_list <- fromJSON(
+  conversation_path,
+  simplifyVector = FALSE
+)
+
+conversation_metadata <- imap_dfr(
+  conversation_list,
+  function(item, thread_id) {
+    tibble(
+      thread_id = thread_id,
+      title = item$title %||% "",
+      reddit_num_comments = as.numeric(item$num_comments %||% NA)
+    )
+  }
+)
+```
+
+
+```{r extract-original-posts}
+original_post_chunks <- list()
+
+keep_original_posts <- function(page) {
+  keep <- !is.na(page$id) &
+    page$id == page$root &
+    is.na(page$reply_to)
+
+  if (!any(keep, na.rm = TRUE)) {
+    return(invisible(NULL))
+  }
+
+  page_meta <- page$meta
+  original_post_chunks[[length(original_post_chunks) + 1L]] <<-
+    tibble(
+      thread_id = page$id[keep],
+      op_text = page$text[keep],
+      op_score = as.numeric(page_meta$score[keep])
+    )
+
+  invisible(NULL)
+}
+
+op_connection <- file(utterance_path, open = "r")
+stream_in(
+  op_connection,
+  handler = keep_original_posts,
+  pagesize = 50000,
+  verbose = FALSE
+)
+close(op_connection)
+
+original_posts <- bind_rows(original_post_chunks)
+```
+
+Now apply the eligibility rule and rank the eligible threads. The code stops for review if the two top-10 lists overlap, because an overlap rule would otherwise be an unreported analytical decision.
+
+```{r sampling-rule}
+eligible_threads <- original_posts %>%
+  left_join(conversation_metadata, by = "thread_id") %>%
+  mutate(
+    op_text = replace_na(op_text, ""),
+    op_status = str_to_lower(str_trim(op_text))
+  ) %>%
+  filter(
+    !op_status %in% c("", "[removed]", "[deleted]"),
+    !is.na(op_score),
+    !is.na(reddit_num_comments)
+  )
+
+most_discussed <- eligible_threads %>%
+  arrange(desc(reddit_num_comments), thread_id) %>%
+  slice_head(n = 10) %>%
+  transmute(thread_id, sample_group = "most_discussed")
+
+best_rated <- eligible_threads %>%
+  arrange(desc(op_score), thread_id) %>%
+  slice_head(n = 10) %>%
+  transmute(thread_id, sample_group = "best_rated")
+
+sample_threads <- bind_rows(most_discussed, best_rated)
+stopifnot(n_distinct(sample_threads$thread_id) == 20)
+
+kable(sample_threads)
+```
+
+
+```{r extract-selected-utterances}
+selected_ids <- sample_threads$thread_id
+selected_chunks <- list()
+
+keep_selected_utterances <- function(page) {
+  keep <- page$root %in% selected_ids
+  if (!any(keep, na.rm = TRUE)) {
+    return(invisible(NULL))
+  }
+
+  selected_page <- page[keep, , drop = FALSE]
+  selected_meta <- selected_page$meta
+
+  selected_chunks[[length(selected_chunks) + 1L]] <<- tibble(
+    utterance_id = selected_page$id,
+    raw_user_id = selected_page$user,
+    thread_id = selected_page$root,
+    reply_to = as.character(selected_page$reply_to),
+    timestamp = selected_page$timestamp,
+    text = selected_page$text,
+    score = selected_meta$score,
+    top_level_comment = as.character(selected_meta$top_level_comment),
+    permalink = selected_meta$permalink
+  )
+
+  invisible(NULL)
+}
+
+utterance_connection <- file(utterance_path, open = "r")
+stream_in(
+  utterance_connection,
+  handler = keep_selected_utterances,
+  pagesize = 10000,
+  verbose = FALSE
+)
+close(utterance_connection)
+
+thread_metadata <- sample_threads %>%
+  left_join(
+    eligible_threads %>%
+      select(
+        thread_id, title, reddit_num_comments, op_score
+      ),
+    by = "thread_id"
+  )
+
+utterances <- bind_rows(selected_chunks) %>%
+  left_join(thread_metadata, by = "thread_id") %>%
+  mutate(
+    text = replace_na(text, ""),
+    is_removed = str_to_lower(str_trim(text)) %in%
+      c("", "[removed]", "[deleted]"),
+    utterance_type = case_when(
+      is.na(reply_to) ~ "original_post",
+      utterance_id == top_level_comment ~ "top_level_comment",
+      TRUE ~ "nested_reply"
+    ),
+    datetime = as.POSIXct(timestamp, origin = "1970-01-01", tz = "UTC")
+  ) %>%
+  group_by(thread_id) %>%
+  mutate(
+    speaker_id = paste0(
+      "speaker_",
+      dense_rank(
+        vapply(raw_user_id, digest, character(1), algo = "sha256")
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  arrange(thread_id, timestamp)
+
+utterances_export <- utterances %>%
+  select(
+    thread_id, sample_group, title, utterance_id, reply_to,
+    top_level_comment, speaker_id, utterance_type, datetime,
+    score, is_removed, text, permalink
+  )
+
+write_csv(
+  utterances_export,
+  file.path(data_dir, "selected_utterances.csv.gz")
+)
+
+eligible_ranking <- eligible_threads %>%
+  transmute(
+    thread_id,
+    title,
+    op_score,
+    reddit_num_comments,
+    rank_by_score = min_rank(desc(op_score)),
+    rank_by_comments = min_rank(desc(reddit_num_comments))
+  )
+
+write_csv(
+  eligible_ranking,
+  file.path(data_dir, "eligible_thread_ranking.csv.gz")
+)
+write_csv(
+  sample_threads,
+  file.path(data_dir, "selected_threads_10_plus_10.csv")
+)
+```
+
+```{r load-sample}
+sample_audit <- utterances %>%
+  summarise(
+    threads = n_distinct(thread_id),
+    original_posts = sum(utterance_type == "original_post"),
+    comment_records = sum(utterance_type != "original_post"),
+    available_comments = sum(
+      utterance_type != "original_post" & !is_removed
+    ),
+    removed_comments = sum(
+      utterance_type != "original_post" & is_removed
+    )
+  )
+
+kable(sample_audit)
+```
+
+
+```{r group-summary}
+group_summary <- utterances %>%
+  group_by(sample_group) %>%
+  summarise(
+    threads = n_distinct(thread_id),
+    total_comment_records = sum(utterance_type != "original_post"),
+    available_comments = sum(
+      utterance_type != "original_post" & !is_removed
+    ),
+    removed_comments = sum(
+      utterance_type != "original_post" & is_removed
+    ),
+    .groups = "drop"
+  )
+
+kable(group_summary, digits = 1)
+```
+
+## Tokenization and staged stopword review
+
+While the standard process of tokenization does not necessarily capture "unusual" typo, so I asked Chatgpt to pick up those and added to the customized stopword list. 
+```{r standard-tokenization}
+data("stop_words", package = "tidytext")
+
+available_utterances <- utterances %>%
+  filter(!is_removed) %>%
+  mutate(
+    base_scope = if_else(
+      utterance_type == "original_post",
+      "original_post",
+      "all_comments"
+    ),
+    analysis_text = if_else(
+      utterance_type == "original_post",
+      str_c(title, text, sep = "\n"),
+      text
+    )
+  )
+
+tokens_all <- available_utterances %>%
+  select(
+    thread_id, sample_group, title, utterance_id,
+    utterance_type, base_scope, datetime, analysis_text
+  ) %>%
+  unnest_tokens(word, analysis_text) %>%
+  group_by(thread_id, utterance_id) %>%
+  mutate(token_position = row_number()) %>%
+  ungroup() %>%
+  filter(str_detect(word, "[a-z]"))
+
+tokens_standard <- tokens_all %>%
+  anti_join(stop_words %>% distinct(word), by = "word")
+```
+
+`token_position` is assigned **before custom cleaning**. This preserves the original within-utterance position needed for a ±5-token window and prevents windows from crossing from one comment into another.
+
+The helper below reproduces the tutorial's table structure: frequency in each text group plus the maximum frequency used to choose the displayed vocabulary.
+
+```{r frequency-comparison-helper}
+compare_group_frequencies <- function(token_data, top_n = 15) {
+  group_counts <- token_data %>%
+    count(sample_group, word, name = "n")
+
+  top_table <- group_counts %>%
+    pivot_wider(
+      names_from = sample_group,
+      values_from = n,
+      values_fill = 0
+    ) %>%
+    mutate(max_n = pmax(best_rated, most_discussed)) %>%
+    arrange(desc(max_n), word) %>%
+    slice_head(n = top_n)
+
+  plot_data <- group_counts %>%
+    semi_join(top_table, by = "word") %>%
+    complete(sample_group, word = top_table$word, fill = list(n = 0)) %>%
+    mutate(word = factor(word, levels = rev(top_table$word)))
+
+  list(table = top_table, plot_data = plot_data)
+}
+```
+
+### Most frequent words before standard stopword removal
+
+```{r top-before-standard}
+frequency_before <- compare_group_frequencies(tokens_all, top_n = 15)
+kable(
+  frequency_before$table,
+  caption = paste(
+    "Top 15 words before stopword removal,",
+    "ranked by maximum sample-group frequency"
+  )
+)
+```
+
+```{r plot-before-standard, fig.width=9, fig.height=5.5}
+ggplot(frequency_before$plot_data, aes(x = n, y = word)) +
+  geom_col(fill = "grey35") +
+  facet_wrap(~ sample_group, nrow = 1, scales = "free_x") +
+  labs(
+    title = "Most frequent words before stopword removal",
+    subtitle = "Top 15 words by maximum frequency across both sample groups",
+    x = "Word frequency",
+    y = NULL
+  )
+```
+
+### Most frequent words after standard stopword removal
+
+```{r top-after-standard}
+frequency_after_standard <- compare_group_frequencies(
+  tokens_standard,
+  top_n = 30
+)
+kable(
+  frequency_after_standard$table,
+  caption = paste(
+    "Top 30 words after standard stopword removal,",
+    "reviewed before defining custom stopwords"
+  )
+)
+```
+
+```{r plot-after-standard, fig.width=9, fig.height=7}
+ggplot(frequency_after_standard$plot_data, aes(x = n, y = word)) +
+  geom_col(fill = "grey35") +
+  facet_wrap(~ sample_group, nrow = 1, scales = "free_x") +
+  labs(
+    title = "Most frequent words after standard stopword removal",
+    subtitle = "Top 30 words shown for review before custom cleaning",
+    x = "Word frequency",
+    y = NULL
+  )
+```
+
+### Record the reviewed custom-stopword decisions
+
+```{r custom-stopword-decisions}
+confirmed_noise <- c(
+  # Web, file, and formatting noise
+  "http", "https", "www", "com", "org",
+  "html", "shtml", "jhtml", "index.php",
+  "amp", "lt", "gt", "nbsp", "utf8", "x200b",
+  "imgur", "jpg", "jpeg", "png", "gif", "gifs",
+  "xveg35z", "i.imgur.com", "imgur.com", "xveg35z.jpg",
+  "wiki", "wikipedia", "wikimedia", "wikiquote",
+  "autowikibot", "ask_wikibot",
+  "en.wikipedia.org", "en.m.wikipedia.org", "en.wiktionary.org",
+  "www.youtube.com", "youtu.be",
+  "www.reddit.com", "www.np.reddit.com",
+  "np.reddit.com", "reddit.com",
+  "xkcd.com", "www.xkcd.com", "www.explainxkcd.com",
+  "xkcdref.info", "coinflipbot.re",
+
+  # Contractions not removed by the standard stopword list
+  "i’m", "it’s", "don’t", "you’re", "that’s", "didn’t",
+  "she’s", "i’ve", "he’s", "they’re", "can’t",
+  "would've", "doesn’t", "there’s", "wasn’t", "y'all",
+  "i’d", "we’re", "wouldn’t", "isn’t", "that'd", "that'll",
+  "aren’t", "could've", "couldn’t", "i’ll", "who'd", "who’s",
+  "won’t", "must've", "there'll", "we’ll", "we’ve", "who've",
+  "you’ve", "how'd", "shouldn’t", "there'd", "they’ve",
+  "what’s", "where'd", "y'know", "haven’t", "he’ll", "it’ll",
+  "might've", "must’ve", "she’ll", "should've", "should’ve",
+  "this'll", "weren’t", "what'll", "who're", "would’ve",
+  "you’ll",
+
+  # Informal or misspelled contractions found in these threads
+  "arn't", "coulden't", "did't", "does't", "dosen't", "dosn't",
+  "iwasn't", "wan't", "who'r", "you'r", "i'm19",
+  "y'all're", "y'all'ren't", "you'dn't've",
+
+  # Pronoun-like possessive contractions with little topical information
+  "else's", "everyone's", "someone's", "anyone's", "one's",
+  "nobody's", "mine's", "other's", "something's", "nothing's",
+  "whoever's", "everything's", "so's"
+)
+
+possible_low_information <- c(
+  "people", "lot", "makes", "pretty", "stuff", "real",
+  "child", "children", "kid", "kids"
+)
+
+stopword_decisions <- bind_rows(
+  tibble(
+    word = confirmed_noise,
+    decision = "confirmed_remove"
+  ),
+  tibble(
+    word = possible_low_information,
+    decision = "possible_remove"
+  )
+) %>%
+  arrange(decision, word)
+
+write_csv(
+  stopword_decisions,
+  file.path(variant_dir, "custom_stopword_decisions.csv")
+)
+
+kable(stopword_decisions)
+```
+
+## Construct the two cleaning variants
+
+```{r cleaning-variants}
+tokens_definite <- tokens_standard %>%
+  filter(!word %in% confirmed_noise)
+
+tokens_definite_possible <- tokens_definite %>%
+  filter(!word %in% possible_low_information)
+
+cleaning_comparison <- tibble(
+  version = c(
+    "after standard stopwords",
+    "standard + definite removals",
+    "standard + definite + possible removals"
+  ),
+  retained_tokens = c(
+    nrow(tokens_standard),
+    nrow(tokens_definite),
+    nrow(tokens_definite_possible)
+  )
+)
+
+kable(cleaning_comparison)
+
+tokens_cleaning_comparison <- bind_rows(
+  tokens_definite %>%
+    mutate(dataset_version = "standard_plus_definite"),
+  tokens_definite_possible %>%
+    mutate(
+      dataset_version = "standard_plus_definite_plus_possible"
+    )
+)
+```
+
+
+## Word frequency and document frequency
+
+```{r frequency-df}
+frequency_df <- tokens_cleaning_comparison %>%
+  count(
+    dataset_version, thread_id, word,
+    name = "frequency_in_thread"
+  ) %>%
+  group_by(dataset_version, word) %>%
+  summarise(
+    total_frequency = sum(frequency_in_thread),
+    document_frequency = n_distinct(thread_id),
+    .groups = "drop"
+  ) %>%
+  arrange(
+    dataset_version,
+    desc(total_frequency),
+    desc(document_frequency)
+  )
+
+top_frequency_df <- frequency_df %>%
+  group_by(dataset_version) %>%
+  slice_max(total_frequency, n = 25, with_ties = FALSE) %>%
+  arrange(dataset_version, desc(total_frequency)) %>%
+  ungroup()
+
+kable(
+  top_frequency_df,
+  caption = paste(
+    "Top 25 terms by total frequency and document frequency",
+    "for each cleaning version"
+  )
+)
+
+ggplot(
+  top_frequency_df,
+  aes(
+    x = total_frequency,
+    y = reorder(word, total_frequency)
+  )
+) +
+  geom_col(fill = "grey35") +
+  facet_wrap(
+    ~ dataset_version,
+    scales = "free"
+  ) +
+  labs(
+    title = "Top 25 words by cleaning version",
+    x = "Word frequency",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+A word appearing in all 20 threads may be broadly relevant but have little power to distinguish one discussion from another.
+
+## TF–IDF for thread-specific language
+
+
+```{r tfidf}
+calculate_thread_tfidf <- function(token_data, version_name) {
+  thread_metadata <- token_data %>%
+    distinct(thread_id, title, sample_group)
+
+  thread_dfm <- token_data %>%
+    count(thread_id, word, name = "n") %>%
+    cast_dfm(
+      document = thread_id,
+      term = word,
+      value = n
+    )
+
+  thread_tfidf_matrix <- thread_dfm %>%
+    dfm_tfidf() %>%
+    as.matrix()
+
+  map_dfr(
+    rownames(thread_tfidf_matrix),
+    function(document_name) {
+      document_scores <- thread_tfidf_matrix[document_name, ]
+
+      highest_scores <- document_scores[
+        document_scores > 0
+      ] %>%
+        sort(decreasing = TRUE) %>%
+        head(10)
+
+      tibble(
+        thread_id = document_name,
+        rank = seq_along(highest_scores),
+        word = names(highest_scores),
+        tfidf = unname(highest_scores)
+      )
+    }
+  ) %>%
+    left_join(thread_metadata, by = "thread_id") %>%
+    mutate(dataset_version = version_name, .before = 1)
+}
+
+top_tfidf_terms <- bind_rows(
+  calculate_thread_tfidf(
+    tokens_definite,
+    "standard_plus_definite"
+  ),
+  calculate_thread_tfidf(
+    tokens_definite_possible,
+    "standard_plus_definite_plus_possible"
+  )
+)
+
+top_tfidf <- top_tfidf_terms %>%
+  arrange(dataset_version, thread_id, rank) %>%
+  group_by(dataset_version, sample_group, thread_id, title) %>%
+  summarise(
+    top_terms = str_c(word, collapse = ", "),
+    .groups = "drop"
+  )
+
+tfidf_review_table <- top_tfidf %>%
+  filter(
+    dataset_version == "standard_plus_definite"
+  ) %>%
+  transmute(
+    sample_group,
+    thread_id,
+    title = str_trunc(title, 55),
+    top_10_terms = top_terms
+  )
+
+kable(
+  tfidf_review_table,
+  col.names = c(
+    "Sample group",
+    "Thread ID",
+    "Thread title",
+    "Top 10 TF–IDF terms"
+  ),
+  caption = "Top 10 distinctive terms for each Reddit thread"
+)
+```
+
+
+
+## Five-word-window kwic analysis
+```{r}
+keyword_dictionary <- tribble(
+  ~keyword,  ~word,
+
+  "time",    "time",
+
+  "vaccine", "vaccine",
+  "vaccine", "vaccines",
+  "vaccine", "vaccinated",
+  "vaccine", "vaccinate",
+  "vaccine", "vaccinating",
+  "vaccine", "vaccination",
+  "vaccine", "vaccinations",
+  "vaccine", "vax",
+
+  "parent",  "parent",
+  "parent",  "parents",
+  "parent",  "parenting",
+  "parent",  "parental",
+  "parent",  "parenthood"
+)
+
+kwic_anchors <- tokens_all %>%
+  inner_join(
+    keyword_dictionary,
+    by = "word",
+    relationship = "many-to-many"
+  ) %>%
+  transmute(
+    anchor_id = row_number(),
+    thread_id,
+    utterance_id,
+    utterance_type,
+    keyword_family = keyword,
+    keyword = word,
+    anchor_position = token_position
+  )
+
+kwic_context_tokens <- tokens_all %>%
+  transmute(
+    thread_id,
+    utterance_id,
+    context_position = token_position,
+    context_word = word
+  )
+
+kwic_all <- kwic_anchors %>%
+  inner_join(
+    kwic_context_tokens,
+    by = c(
+      "thread_id",
+      "utterance_id"
+    ),
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    abs(context_position - anchor_position) <= 5
+  ) %>%
+  mutate(
+    displayed_word = if_else(
+      context_position == anchor_position,
+      str_c("[ ", context_word, " ]"),
+      context_word
+    )
+  ) %>%
+  group_by(
+    anchor_id,
+    thread_id,
+    utterance_id,
+    utterance_type,
+    keyword_family,
+    keyword
+  ) %>%
+  arrange(
+    context_position,
+    .by_group = TRUE
+  ) %>%
+  summarise(
+    kwic = str_c(
+      displayed_word,
+      collapse = " "
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(
+    keyword_family,
+    thread_id,
+    anchor_id
+  )
+kwic_display <- kwic_all %>%
+  group_by(
+    keyword_family,
+    thread_id
+  ) %>%
+  slice_head(n = 2) %>%
+  ungroup() %>%
+  select(
+    thread_id,
+    utterance_type,
+    keyword,
+    kwic
+  )
+
+
+kable(
+  kwic_display,
+  caption = paste(
+    "KWIC examples for time, vaccine,",
+    "and parent keyword families"
+  )
+)
+
+write_csv(
+  kwic_all,
+  file.path(
+    table_dir,
+    "kwic_time_vaccine_parent_all.csv"
+  )
+)
+```
+
+
+## Sentiment analysis 
+### Load the Bing and NRC diction 
+```{r}
+sentiment_table_dir <- file.path(
+  table_dir,
+  "sentiment"
+)
+
+dir.create(
+  sentiment_table_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+if (!requireNamespace("textdata", quietly = TRUE)) {
+  install.packages(
+    "textdata",
+    repos = "https://cloud.r-project.org"
+  )
+}
+
+nrc_storage_dir <- file.path(
+  project_dir,
+  "data",
+  "external",
+  "textdata"
+)
+
+dir.create(
+  nrc_storage_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+nrc_lexicon <- textdata::lexicon_nrc(
+  dir = nrc_storage_dir
+) %>%
+  transmute(
+    word = str_to_lower(word),
+    sentiment,
+    lexicon = "NRC"
+  ) %>%
+  distinct()
+
+
+bing_lexicon <- get_sentiments("bing") %>%
+  transmute(
+    word = str_to_lower(word),
+    sentiment,
+    lexicon = "Bing"
+  ) %>%
+  distinct()
+
+
+sentiment_lexicons <- bind_rows(
+  nrc_lexicon,
+  bing_lexicon
+)
+
+
+lexicon_summary <- sentiment_lexicons %>%
+  group_by(lexicon) %>%
+  summarise(
+    word_sentiment_pairs = n(),
+    unique_words = n_distinct(word),
+    sentiment_categories = str_c(
+      sort(unique(sentiment)),
+      collapse = ", "
+    ),
+    .groups = "drop"
+  )
+
+kable(
+  lexicon_summary,
+  caption = "Sentiment dictionaries used in the analysis"
+)
+
+nrc_emotions <- c(
+  "anger",
+  "anticipation",
+  "disgust",
+  "fear",
+  "joy",
+  "sadness",
+  "surprise",
+  "trust"
+)
+```
+
+### Unweighted sentiment analysis 
+```{r}
+sentiment_tokens <- bind_rows(
+
+  # Keep OP and comments as separate scopes.
+  tokens_cleaning_comparison %>%
+    mutate(
+      text_scope = if_else(
+        utterance_type == "original_post",
+        "original_post",
+        "all_comments"
+      )
+    ),
+
+  # Duplicate all tokens into the whole-thread scope.
+  tokens_cleaning_comparison %>%
+    mutate(
+      text_scope = "whole_thread"
+    )
+)
+
+scope_audit <- sentiment_tokens %>%
+  distinct(
+    dataset_version,
+    text_scope,
+    thread_id
+  ) %>%
+  count(
+    dataset_version,
+    text_scope,
+    name = "threads"
+  )
+
+kable(
+  scope_audit,
+  caption = "Number of thread-documents in each analytical scope"
+)
+
+stopifnot(all(scope_audit$threads == 20))
+
+sentiment_documents <- sentiment_tokens %>%
+  distinct(
+    dataset_version,
+    thread_id,
+    sample_group,
+    title,
+    text_scope
+  )
+
+
+sentiment_token_totals <- sentiment_tokens %>%
+  count(
+    dataset_version,
+    thread_id,
+    sample_group,
+    title,
+    text_scope,
+    name = "total_tokens"
+  )
+
+
+sentiment_word_counts <- sentiment_tokens %>%
+  count(
+    dataset_version,
+    thread_id,
+    sample_group,
+    title,
+    text_scope,
+    word,
+    name = "term_count"
+  )
+
+
+sentiment_levels <- sentiment_lexicons %>%
+  distinct(
+    lexicon,
+    sentiment
+  )
+
+
+unweighted_observed <- sentiment_word_counts %>%
+  inner_join(
+    sentiment_lexicons,
+    by = "word",
+    relationship = "many-to-many"
+  ) %>%
+  group_by(
+    dataset_version,
+    thread_id,
+    sample_group,
+    title,
+    text_scope,
+    lexicon,
+    sentiment
+  ) %>%
+  summarise(
+    matched_tokens = sum(term_count),
+    .groups = "drop"
+  )
+
+unweighted_results <- sentiment_documents %>%
+  crossing(sentiment_levels) %>%
+  left_join(
+    unweighted_observed,
+    by = c(
+      "dataset_version",
+      "thread_id",
+      "sample_group",
+      "title",
+      "text_scope",
+      "lexicon",
+      "sentiment"
+    )
+  ) %>%
+  left_join(
+    sentiment_token_totals,
+    by = c(
+      "dataset_version",
+      "thread_id",
+      "sample_group",
+      "title",
+      "text_scope"
+    )
+  ) %>%
+  mutate(
+    matched_tokens = replace_na(
+      matched_tokens,
+      0L
+    ),
+    rate_per_1000_tokens =
+      1000 * matched_tokens / total_tokens
+  ) %>%
+  arrange(
+    dataset_version,
+    text_scope,
+    thread_id,
+    lexicon,
+    sentiment
+  )
+```
+
+#### Unweighted NRC sentiment by text scope
+```{r}
+nrc_unweighted_summary <- unweighted_results %>%
+  filter(
+    lexicon == "NRC",
+    sentiment %in% nrc_emotions
+  ) %>%
+  group_by(
+    dataset_version,
+    text_scope,
+    sentiment
+  ) %>%
+  summarise(
+    mean_thread_rate = mean(
+      rate_per_1000_tokens
+    ),
+    median_thread_rate = median(
+      rate_per_1000_tokens
+    ),
+    .groups = "drop"
+  )
+
+
+kable(
+  nrc_unweighted_summary,
+  digits = 2,
+  caption = paste(
+    "Unweighted NRC emotion-word rates",
+    "by cleaning version and text scope"
+  )
+)
+
+
+ggplot(
+  nrc_unweighted_summary,
+  aes(
+    x = sentiment,
+    y = mean_thread_rate,
+    fill = dataset_version
+  )
+) +
+  geom_col(
+    position = "dodge"
+  ) +
+  coord_flip() +
+  facet_wrap(
+    ~ text_scope,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Unweighted NRC emotion-word rates",
+    subtitle = "Each thread contributes equally to the displayed mean",
+    x = NULL,
+    y = "Mean rate per 1,000 retained tokens",
+    fill = "Cleaning version"
+  ) +
+  theme_minimal()
+```
+
+#### Unweighted Bing sentiment by text scope
+```{r}
+bing_unweighted_net <- unweighted_results %>%
+  filter(
+    lexicon == "Bing"
+  ) %>%
+  select(
+    dataset_version,
+    thread_id,
+    sample_group,
+    title,
+    text_scope,
+    sentiment,
+    rate_per_1000_tokens
+  ) %>%
+  pivot_wider(
+    names_from = sentiment,
+    values_from = rate_per_1000_tokens,
+    values_fill = 0
+  ) %>%
+  mutate(
+    net_sentiment =
+      positive - negative
+  )
+
+
+bing_unweighted_summary <- bing_unweighted_net %>%
+  group_by(
+    dataset_version,
+    text_scope
+  ) %>%
+  summarise(
+    mean_positive_rate = mean(positive),
+    mean_negative_rate = mean(negative),
+    mean_net_sentiment = mean(net_sentiment),
+    median_net_sentiment = median(net_sentiment),
+    .groups = "drop"
+  )
+
+
+kable(
+  bing_unweighted_summary,
+  digits = 2,
+  caption = "Unweighted Bing sentiment by text scope"
+)
+```
+
+
+### TF–IDF-weighted sentiment analysis
+```{r}
+sentiment_tfidf_terms <- sentiment_word_counts %>%
+  group_by(
+    dataset_version,
+    text_scope
+  ) %>%
+  group_modify(
+    ~ bind_tf_idf(
+      .x,
+      term = word,
+      document = thread_id,
+      n = term_count
+    )
+  ) %>%
+  ungroup()
+
+total_tfidf_by_document <- sentiment_tfidf_terms %>%
+  group_by(
+    dataset_version,
+    thread_id,
+    sample_group,
+    title,
+    text_scope
+  ) %>%
+  summarise(
+    total_tfidf = sum(tf_idf),
+    .groups = "drop"
+  )
+
+weighted_observed <- sentiment_tfidf_terms %>%
+  inner_join(
+    sentiment_lexicons,
+    by = "word",
+    relationship = "many-to-many"
+  ) %>%
+  group_by(
+    dataset_version,
+    thread_id,
+    sample_group,
+    title,
+    text_scope,
+    lexicon,
+    sentiment
+  ) %>%
+  summarise(
+    sentiment_tfidf = sum(tf_idf),
+    .groups = "drop"
+  )
+weighted_results <- sentiment_documents %>%
+  crossing(sentiment_levels) %>%
+  left_join(
+    weighted_observed,
+    by = c(
+      "dataset_version",
+      "thread_id",
+      "sample_group",
+      "title",
+      "text_scope",
+      "lexicon",
+      "sentiment"
+    )
+  ) %>%
+  left_join(
+    total_tfidf_by_document,
+    by = c(
+      "dataset_version",
+      "thread_id",
+      "sample_group",
+      "title",
+      "text_scope"
+    )
+  ) %>%
+  mutate(
+    sentiment_tfidf = replace_na(
+      sentiment_tfidf,
+      0
+    ),
+    tfidf_share = if_else(
+      total_tfidf > 0,
+      sentiment_tfidf / total_tfidf,
+      NA_real_
+    )
+  ) %>%
+  arrange(
+    dataset_version,
+    text_scope,
+    thread_id,
+    lexicon,
+    sentiment
+  )
+```
+
+#### TF–IDF-weighted NRC sentiment 
+```{r}
+nrc_weighted_summary <- weighted_results %>%
+  filter(
+    lexicon == "NRC",
+    sentiment %in% nrc_emotions
+  ) %>%
+  group_by(
+    dataset_version,
+    text_scope,
+    sentiment
+  ) %>%
+  summarise(
+    mean_thread_tfidf_share = mean(
+      tfidf_share,
+      na.rm = TRUE
+    ),
+    median_thread_tfidf_share = median(
+      tfidf_share,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+
+kable(
+  nrc_weighted_summary,
+  digits = 4,
+  caption = paste(
+    "TF-IDF-weighted NRC emotion shares",
+    "by cleaning version and text scope"
+  )
+)
+
+
+ggplot(
+  nrc_weighted_summary,
+  aes(
+    x = sentiment,
+    y = mean_thread_tfidf_share,
+    fill = dataset_version
+  )
+) +
+  geom_col(
+    position = "dodge"
+  ) +
+  coord_flip() +
+  facet_wrap(
+    ~ text_scope,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "TF-IDF-weighted NRC emotion shares",
+    subtitle = "TF-IDF is calculated separately within each text scope",
+    x = NULL,
+    y = "Mean thread TF-IDF share",
+    fill = "Cleaning version"
+  ) +
+  theme_minimal()
+```
+
+#### TF–IDF-weighted Bing sentiment 
+```{r}
+bing_weighted_net <- weighted_results %>%
+  filter(
+    lexicon == "Bing"
+  ) %>%
+  select(
+    dataset_version,
+    thread_id,
+    sample_group,
+    title,
+    text_scope,
+    sentiment,
+    tfidf_share
+  ) %>%
+  pivot_wider(
+    names_from = sentiment,
+    values_from = tfidf_share,
+    values_fill = 0
+  ) %>%
+  mutate(
+    tfidf_net_sentiment =
+      positive - negative
+  )
+
+
+bing_weighted_summary <- bing_weighted_net %>%
+  group_by(
+    dataset_version,
+    text_scope
+  ) %>%
+  summarise(
+    mean_positive_share = mean(
+      positive,
+      na.rm = TRUE
+    ),
+    mean_negative_share = mean(
+      negative,
+      na.rm = TRUE
+    ),
+    mean_net_share = mean(
+      tfidf_net_sentiment,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+
+kable(
+  bing_weighted_summary,
+  digits = 4,
+  caption = "TF-IDF-weighted Bing sentiment by text scope"
+)
+```
+
+```{r} 
+write_csv(
+  unweighted_results,
+  file.path(
+    sentiment_table_dir,
+    "sentiment_unweighted_by_thread.csv"
+  )
+)
+
+write_csv(
+  weighted_results,
+  file.path(
+    sentiment_table_dir,
+    "sentiment_tfidf_weighted_by_thread.csv"
+  )
+)
+
+write_csv(
+  bing_unweighted_net,
+  file.path(
+    sentiment_table_dir,
+    "bing_unweighted_net_by_thread.csv"
+  )
+)
+
+write_csv(
+  bing_weighted_net,
+  file.path(
+    sentiment_table_dir,
+    "bing_tfidf_net_by_thread.csv"
+  )
+)
+
+write_csv(
+  nrc_unweighted_summary,
+  file.path(
+    sentiment_table_dir,
+    "nrc_unweighted_summary.csv"
+  )
+)
+
+write_csv(
+  nrc_weighted_summary,
+  file.path(
+    sentiment_table_dir,
+    "nrc_tfidf_weighted_summary.csv"
+  )
+)
+```
